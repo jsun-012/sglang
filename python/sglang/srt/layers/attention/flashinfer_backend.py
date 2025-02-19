@@ -54,7 +54,9 @@ class DecodeMetadata:
 
 @dataclass
 class PrefillMetadata:
-    prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper]
+    prefill_wrappers: List[
+        Union[BatchPrefillWithPagedKVCacheWrapper, BatchMLAPagedAttentionWrapper]
+    ]
     use_ragged: bool
     extend_no_prefix: bool
 
@@ -108,7 +110,8 @@ class FlashInferAttnBackend(AttentionBackend):
             global_config.flashinfer_workspace_size = 512 * 1024 * 1024
 
         self.enable_flashinfer_mla = False
-        if "DeepseekV3ForCausalLM" in model_runner.model_config.hf_config.architectures:
+        if ("DeepseekV3ForCausalLM" in model_runner.model_config.hf_config.architectures or 
+            "DeepseekV3ForCausalLMNextN" in model_runner.model_config.hf_config.architectures):
             if global_server_args_dict["enable_flashinfer_mla"]:
                 self.enable_flashinfer_mla = True
                 global_config.enable_flashinfer_mla = True
@@ -160,17 +163,38 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_wrappers = []
         for _ in range(self.num_wrappers):
             if not skip_prefill:
-                self.prefill_wrappers_paged.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend="fa2",
+                if (
+                    self.enable_flashinfer_mla
+                    and not global_server_args_dict["disable_radix_cache"]
+                ):
+                    # use mla paged prefill
+                    self.prefill_wrappers_paged.append(
+                        BatchMLAPagedAttentionWrapper(
+                            self.workspace_buffer,
+                            backend="fa2",
+                        )
                     )
-                )
-                self.prefill_wrappers_verify.append(
-                    BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
-                )
+                    self.prefill_wrappers_verify.append(
+                        BatchMLAPagedAttentionWrapper(
+                            self.workspace_buffer,
+                            backend="fa2",
+                        )
+                    )
+                else:
+                    self.prefill_wrappers_paged.append(
+                        BatchPrefillWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                            backend="fa2",
+                        )
+                    )
+                    self.prefill_wrappers_verify.append(
+                        BatchPrefillWithPagedKVCacheWrapper(
+                            self.workspace_buffer, "NHD"
+                        )
+                    )
             if self.enable_flashinfer_mla:
+                print("???????????????????? decode should be here ???????????????????????")
                 self.decode_wrappers.append(
                     BatchMLAPagedAttentionWrapper(self.workspace_buffer, backend="fa2")
                 )
@@ -196,6 +220,9 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        # print(forward_batch.forward_mode)
+        # print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        # raise
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -237,7 +264,10 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
-            if self.is_multimodal:
+            if self.is_multimodal or (
+                self.enable_flashinfer_mla
+                and not global_server_args_dict["disable_radix_cache"]
+            ):
                 use_ragged = False
                 extend_no_prefix = False
             else:
@@ -289,14 +319,22 @@ class FlashInferAttnBackend(AttentionBackend):
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        # prefix_lens: Optional[torch.Tensor],
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
     ):
         if forward_mode.is_decode_or_idle():
+            print("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             decode_wrappers = []
             for i in range(self.num_wrappers):
                 if self.enable_flashinfer_mla:
+                    # print("^^^^^^^^^^^^^^^^^^^^^ this is correct ^^^^^^^^^^^^^^^^^^^^^")
+                    print("^^^^^^^^^^^^^^^^^^^ debug kv_len_arr: ", self.kv_last_page_len[:num_tokens])
+                    print("kv_len/seq_len: ", seq_lens)
+                    print("kv_last_page_len: ", self.kv_last_page_len)
+                    print("batch size: ", bs)
+                    print("num tokens: ", num_tokens)
                     decode_wrappers.append(
                         BatchMLAPagedAttentionWrapper(
                             self.workspace_buffer,
@@ -309,6 +347,8 @@ class FlashInferAttnBackend(AttentionBackend):
                         )
                     )
                 else:
+                    # print("^^^^^^^^^^^^^^^^^^^^^ should not be here ^^^^^^^^^^^^^^^^^^^^^")
+                    # raise
                     decode_wrappers.append(
                         BatchDecodeWithPagedKVCacheWrapper(
                             self.workspace_buffer,
@@ -334,22 +374,38 @@ class FlashInferAttnBackend(AttentionBackend):
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
         elif forward_mode.is_target_verify():
+            print("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
             prefill_wrappers = []
             for i in range(self.num_wrappers):
-                prefill_wrappers.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        use_cuda_graph=True,
-                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
-                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
-                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
-                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                        custom_mask_buf=self.cuda_graph_custom_mask,
-                        mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
+                if global_config.enable_flashinfer_mla:
+                    prefill_wrappers.append(
+                        BatchMLAPagedAttentionWrapper(
+                            self.workspace_buffer,
+                            use_cuda_graph=True,
+                            qo_indptr=self.qo_indptr[i][: bs + 1],
+                            kv_indptr=self.kv_indptr[i][: bs + 1],
+                            kv_indices=self.cuda_graph_kv_indices[i],
+                            kv_len_arr=self.kv_last_page_len[:bs],
+                            backend="fa2",
+                        )
                     )
-                )
+                else:
+                    prefill_wrappers.append(
+                        BatchPrefillWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                            use_cuda_graph=True,
+                            qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                            paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                            paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                            paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                            custom_mask_buf=self.cuda_graph_custom_mask,
+                            mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
+                        )
+                    )
             seq_lens_sum = seq_lens.sum().item()
+            # print("!!!!!!!!!!!!!!!! here !!!!!!!!!!!!")
+            # prefix_lens = forward_batch.extend_prefix_lens
             self.indices_updater_prefill.update(
                 req_pool_indices,
                 seq_lens,
@@ -363,6 +419,7 @@ class FlashInferAttnBackend(AttentionBackend):
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         else:
+            print("ccccccccccccccccccccccccccccccccc")
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
     def init_forward_metadata_replay_cuda_graph(
@@ -418,24 +475,44 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
             logits_soft_cap = layer.logit_cap
+            # print("!!!!!!!!! disable_radix_cache? ", global_server_args_dict)
+            if global_server_args_dict["disable_radix_cache"] and not forward_batch.forward_mode.is_target_verify(): # turn it off first force to use paged
+                # use mla ragged prefill
+                o, _ = self.prefill_wrapper_ragged.forward_return_lse(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
+                )
 
-            o1, _ = self.prefill_wrapper_ragged.forward_return_lse(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                causal=True,
-                sm_scale=layer.scaling,
-                logits_soft_cap=logits_soft_cap,
-            )
-
-            o = o1
-
-            if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    cache_loc,
-                    k,
-                    v,
+                if save_kv_cache:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                    )
+            else:
+                # print("should run here for spec + flashinfer")
+                # use mla paged prefill
+                prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
+                    self._get_wrapper_idx(layer)
+                ]
+                if k is not None:
+                    assert v is not None
+                    if save_kv_cache:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer, cache_loc, k, v
+                        )
+                qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                o = prefill_wrapper_paged.run(
+                    qall[:, :, : layer.v_head_dim],
+                    qall[:, :, layer.v_head_dim :],
+                    k_buf[:, :, : layer.v_head_dim],
+                    k_buf[:, :, layer.v_head_dim :],
                 )
 
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -733,30 +810,40 @@ class FlashInferIndicesUpdaterDecode:
         if global_config.enable_flashinfer_mla:
             sm_scale = 1.0 / math.sqrt(192)
             q_indptr = torch.arange(0, bs + 1).to(0).int()
-            kv_lens = paged_kernel_lens.to(torch.int32)
+            if spec_info is not None:
+                kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
+            else:
+                kv_len_arr = paged_kernel_lens.to(torch.int32)
+            
+            print("===========================================")
+            print("!!!spec debug qo_indptr: ", q_indptr)
+            print("!!!spec debug kv_indptr: ", kv_indptr)
+            print("!!!sepc debug kv lens: ", kv_len_arr)
+            # mla paged wrapper
             wrapper.plan(
-                q_indptr,
-                kv_indptr,
-                kv_indices,
-                kv_lens,
-                self.num_qo_heads,
-                512,
-                64,
-                1,
-                False,
-                sm_scale,
-                self.data_type,
-                self.data_type,
+                qo_indptr = q_indptr,
+                kv_indptr = kv_indptr,
+                kv_indices = kv_indices,
+                kv_len_arr = kv_len_arr,
+                num_heads = self.num_qo_heads,
+                head_dim_ckv = 512,
+                head_dim_kpe = 64,
+                page_size = 1,
+                causal = False,
+                sm_scale = sm_scale,
+                q_data_type = self.data_type,
+                kv_data_type = self.data_type,
             )
         else:
+            # paged wrapper
             wrapper.begin_forward(
-                kv_indptr,
-                kv_indices,
-                self.kv_last_page_len[:bs],
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                1,
+                indptr = kv_indptr,
+                indices = kv_indices,
+                last_page_len = self.kv_last_page_len[:bs],
+                num_qo_heads = self.num_qo_heads,
+                num_kv_heads = self.num_kv_heads,
+                head_dim = self.head_dim,
+                page_size = 1,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
@@ -800,7 +887,9 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
-        prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
+        prefill_wrappers: List[
+            Union[BatchPrefillWithPagedKVCacheWrapper, BatchMLAPagedAttentionWrapper]
+        ],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
@@ -814,12 +903,16 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
-        prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
+        prefill_wrappers: List[
+            Union[BatchPrefillWithPagedKVCacheWrapper, BatchMLAPagedAttentionWrapper]
+        ],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
         if use_ragged:
+            # paged_kernel_lens = prefix_lens if prefix_lens is not None else torch.zeros_like(seq_lens)
+            # paged_kernel_lens_sum = paged_kernel_lens.sum().item() if paged_kernel_lens is not None else 0
             paged_kernel_lens = prefix_lens
             paged_kernel_lens_sum = paged_kernel_lens.sum().item()
         else:
@@ -923,7 +1016,9 @@ class FlashInferIndicesUpdaterPrefill:
     def call_begin_forward(
         self,
         wrapper_ragged: BatchPrefillWithRaggedKVCacheWrapper,
-        wrapper_paged: BatchPrefillWithPagedKVCacheWrapper,
+        wrapper_paged: Union[
+            BatchPrefillWithPagedKVCacheWrapper, BatchMLAPagedAttentionWrapper
+        ],
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
@@ -936,7 +1031,9 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInfo],
     ):
         bs = len(req_pool_indices)
+        print("11111111111111111111111111111111111111")
         if spec_info is None:
+            print("22222222222222222222222222222222222222")
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
@@ -959,6 +1056,7 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
         else:
+            print("33333333333333333333333333333333333333333")
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
                     req_pool_indices,
@@ -969,6 +1067,7 @@ class FlashInferIndicesUpdaterPrefill:
 
         # extend part
         if use_ragged:
+            print("44444444444444444444444444444444444444444")
             if global_config.enable_flashinfer_mla:
                 wrapper_ragged.begin_forward(
                     qo_indptr=qo_indptr,
@@ -990,6 +1089,7 @@ class FlashInferIndicesUpdaterPrefill:
                 )
 
         if not global_config.enable_flashinfer_mla:
+            print("555555555555555555555555555555555555555555")
             # cached part
             wrapper_paged.begin_forward(
                 qo_indptr,
@@ -1004,6 +1104,48 @@ class FlashInferIndicesUpdaterPrefill:
                 custom_mask=custom_mask,
                 non_blocking=True,
             )
+        elif (
+            global_config.enable_flashinfer_mla
+        ):
+            if not global_server_args_dict["disable_radix_cache"]:
+                # mla paged prefill
+                kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
+                wrapper_paged.plan(
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    kv_len_arr,
+                    self.num_qo_heads,
+                    512,
+                    64,
+                    1,
+                    True,
+                    1 / math.sqrt(192),
+                    self.data_type,
+                    self.data_type,
+                )
+            else:
+                print("66666666666666666666666666666666666666")
+                print("666666666666666 debug qo_indptr: ", qo_indptr)
+                print("666666666666666 debug kv_indptr: ", kv_indptr)
+                # mla paged prefill for spec
+                kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
+                print("666666666666666 debug kv_len_arr: ", kv_len_arr)
+                wrapper_paged.plan(
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    kv_len_arr,
+                    self.num_qo_heads,
+                    512,
+                    64,
+                    1,
+                    True,
+                    1 / math.sqrt(192),
+                    self.data_type,
+                    self.data_type,
+                )
+
 
 
 class FlashInferMultiStepDraftBackend:
@@ -1023,7 +1165,7 @@ class FlashInferMultiStepDraftBackend:
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
-        max_bs = model_runner.req_to_token_pool.size
+        max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
             (
                 self.speculative_num_steps,
@@ -1111,12 +1253,14 @@ class FlashInferMultiStepDraftBackend:
             )
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
+        print("2222222 topk: ", self.topk)
         def call_fn(i, forward_batch):
             self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
                 forward_batch.batch_size,
                 forward_batch.batch_size * self.topk,
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
+                # forward_batch.extend_prefix_lens,
                 encoder_lens=None,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,

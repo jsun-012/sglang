@@ -282,6 +282,8 @@ class EagleVerifyInput:
             (batch_size + 1,), dtype=torch.int32, device="cuda"
         )
 
+        # print("!!!!!!!! debug , paged_kernel_lens", paged_kernel_lens)
+
         paged_kernel_lens = paged_kernel_lens + self.draft_token_num
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 

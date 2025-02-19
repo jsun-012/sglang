@@ -365,11 +365,14 @@ class CudaGraphRunner:
         )
 
         # Attention backend
+        print("111111111 bs: ", bs)
+        print("222222222 num_tokens: ", num_tokens)
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
             num_tokens,
             req_pool_indices,
             seq_lens,
+            # forward_batch.extend_prefix_lens,
             encoder_lens,
             forward_batch.forward_mode,
             forward_batch.spec_info,
@@ -377,6 +380,9 @@ class CudaGraphRunner:
 
         # Run and capture
         def run_once():
+            # print("!!!!!!!!!!!!")
+            # print(forward_batch.forward_mode)
+            # print("!!!!!!!!!!!!")
             logits_output = forward(input_ids, forward_batch.positions, forward_batch)
             return logits_output.next_token_logits, logits_output.hidden_states
 
