@@ -131,17 +131,47 @@ class RadixCache(BasePrefixCache):
     def cache_finished_req(self, req: Req, token_ids: Optional[List[int]] = None):
         """Cache request when it finishes."""
         if self.disable:
+            print("---req input size: ", len(req.origin_input_ids))
+            print("---req output size: ", len(req.output_ids))
+            print("---req prefix size: ", len(req.prefix_indices))
+            print(
+                f"---avaiable size: {self.token_to_kv_pool.available_size()} \n"
+                f"---evitcable size: {self.evictable_size()} \n"
+                f"---protected size: {self.protected_size()} \n"
+            )
+
             if token_ids is None:
                 token_ids_len = len(req.origin_input_ids) + len(req.output_ids) - 1
             else:
                 token_ids_len = len(token_ids)
+
+            print(f"------ {token_ids_len: } -------")
 
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :token_ids_len
             ]
             self.token_to_kv_pool.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
+
+            print("***req input size: ", len(req.origin_input_ids))
+            print("***req output size: ", len(req.output_ids))
+            print("***req prefix size: ", len(req.prefix_indices))
+            print(
+                f"***avaiable size: {self.token_to_kv_pool.available_size()} \n"
+                f"***evitcable size: {self.evictable_size()} \n"
+                f"***protected size: {self.protected_size()} \n"
+            )
             return
+
+        print("111 req input size: ", len(req.origin_input_ids))
+        print("111 req output size: ", len(req.output_ids))
+        print("111 req prefix size: ", len(req.prefix_indices))
+        print(
+            f"111 avaiable size: {self.token_to_kv_pool.available_size()} \n"
+            f"111 evitcable size: {self.evictable_size()} \n"
+            f"111 protected size: {self.protected_size()} \n"
+        )
+
 
         if token_ids is None:
             token_ids = (req.origin_input_ids + req.output_ids)[:-1]
@@ -153,9 +183,27 @@ class RadixCache(BasePrefixCache):
         new_prefix_len = self.insert(token_ids, kv_indices.clone())
         self.token_to_kv_pool.free(kv_indices[len(req.prefix_indices) : new_prefix_len])
 
+        print("222 req input size: ", len(req.origin_input_ids))
+        print("222 req output size: ", len(req.output_ids))
+        print("222 req prefix size: ", len(req.prefix_indices))
+        print(
+            f"222 avaiable size: {self.token_to_kv_pool.available_size()} \n"
+            f"222 evitcable size: {self.evictable_size()} \n"
+            f"222 protected size: {self.protected_size()} \n"
+        )
+
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
+
+        print("333 req input size: ", len(req.origin_input_ids))
+        print("333 req output size: ", len(req.output_ids))
+        print("333 req prefix size: ", len(req.prefix_indices))
+        print(
+            f"333 avaiable size: {self.token_to_kv_pool.available_size()} \n"
+            f"333 evitcable size: {self.evictable_size()} \n"
+            f"333 protected size: {self.protected_size()} \n"
+        )
 
 
     def cache_unfinished_req(self, req: Req, token_ids: Optional[List[int]] = None):

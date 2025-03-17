@@ -289,6 +289,7 @@ class DecodeScheduler:
         ) = self.tp_worker.get_worker_info()
         self.tp_cpu_group = self.tp_worker.get_tp_cpu_group()
         self.attn_tp_cpu_group = self.tp_worker.get_attention_tp_cpu_group()
+        self.kv_transfer_group = torch.distributed.new_group(list(range(self.attn_tp_size)), backend="gloo")
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         global_server_args_dict.update(worker_global_server_args_dict)
         set_random_seed(self.random_seed)
@@ -534,11 +535,22 @@ class DecodeScheduler:
         self.result_queue = deque()
 
         while True:
+            if self.attn_tp_rank == 0:
+                print(" 0 ")
             recv_reqs = self.recv_requests()
+
+            if self.attn_tp_rank == 0:
+                print(" 0000 ")
+
             self.process_input_requests(recv_reqs)
 
+            if self.attn_tp_rank == 0:
+                print(" keep looping ---")
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+
+            if self.attn_tp_rank == 0:
+                print(" 1 ")
 
             if batch:
                 result = self.run_batch(batch)
@@ -553,7 +565,8 @@ class DecodeScheduler:
                         next_batch_sampling_info=self.tp_worker.cur_sampling_info,
                     )
                     self.process_batch_result(tmp_batch, None)
-
+            if self.attn_tp_rank == 0:
+                print(" 2 ")
             if self.last_batch:
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
@@ -567,6 +580,8 @@ class DecodeScheduler:
                 # this req might already occupy some memory.
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
+            if self.attn_tp_rank == 0:
+                print(" 3 ")
 
             self.last_batch = batch
 
@@ -577,7 +592,9 @@ class DecodeScheduler:
 
             while True:
                 try:
+                    print("recv 0")
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    print("recv 1")
                 except zmq.ZMQError:
                     break
                 recv_reqs.append(recv_req)
@@ -619,6 +636,8 @@ class DecodeScheduler:
             recv_reqs = work_reqs + control_reqs
         elif self.tp_size != 1:
             recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
+        
+        print(f"rank: {self.attn_tp_rank} finish recv")
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
@@ -677,15 +696,15 @@ class DecodeScheduler:
         token_ids = req.origin_input_ids + req.output_ids
         context_length = len(token_ids) - 1
 
-        # if self.attn_tp_rank == 0:
-        #     print("???req input size: ", len(req.origin_input_ids))
-        #     print("???req output size: ", len(req.output_ids))
-        #     print("???req prefix size: ", len(req.prefix_indices))
-        #     print(
-        #         f"???avaiable size: {self.token_to_kv_pool.available_size()} \n"
-        #         f"???evitcable size: {self.tree_cache.evictable_size()} \n"
-        #         f"???protected size: {self.tree_cache.protected_size()} \n"
-        #     )
+        if self.attn_tp_rank == 0:
+            print("???req input size: ", len(req.origin_input_ids))
+            print("???req output size: ", len(req.output_ids))
+            print("???req prefix size: ", len(req.prefix_indices))
+            print(
+                f"???avaiable size: {self.token_to_kv_pool.available_size()} \n"
+                f"???evitcable size: {self.tree_cache.evictable_size()} \n"
+                f"???protected size: {self.tree_cache.protected_size()} \n"
+            )
 
         # TODO: this shape is for MLA model, need to have a utility function for this
         shape = (self.token_to_kv_pool.layer_num, context_length, 1, self.token_to_kv_pool.kv_buffer[0].shape[-1])
@@ -706,7 +725,7 @@ class DecodeScheduler:
                 kv_cache = torch.empty(shape, dtype=torch.bfloat16, device=f'cuda:{self.attn_tp_rank}')
 
             # Broadcast actual tensor data
-            dist.broadcast(kv_cache, src=0)
+            dist.broadcast(kv_cache, src=0, group=self.kv_transfer_group)
 
             # copy kv cache to managed kv pool, and let tree cache keep track of it
             device_indices = self.token_to_kv_pool.alloc(context_length)
@@ -724,18 +743,20 @@ class DecodeScheduler:
             # req.prefix_indices = new_indices
             # req.last_node = new_last_node
 
-        # if self.attn_tp_rank == 0:
-        #     print("???req input size: ", len(req.origin_input_ids))
-        #     print("???req output size: ", len(req.output_ids))
-        #     print("???req prefix size: ", len(req.prefix_indices))
-        #     print(
-        #         f"???avaiable size: {self.token_to_kv_pool.available_size()} \n"
-        #         f"???evitcable size: {self.tree_cache.evictable_size()} \n"
-        #         f"???protected size: {self.tree_cache.protected_size()} \n"
-        #     )
+        if self.attn_tp_rank == 0:
+            print("???req input size: ", len(req.origin_input_ids))
+            print("???req output size: ", len(req.output_ids))
+            print("???req prefix size: ", len(req.prefix_indices))
+            print(
+                f"???avaiable size: {self.token_to_kv_pool.available_size()} \n"
+                f"???evitcable size: {self.tree_cache.evictable_size()} \n"
+                f"???protected size: {self.tree_cache.protected_size()} \n"
+            )
 
         # self.req_to_token_pool.req_to_token[req.req_pool_idx][:context_length] = device_indices
-        self.waiting_queue.append(req)        
+        self.waiting_queue.append(req) 
+        print("--------------- add one req -----------------------")
+
 
     def distribute_to_prefill(
         self,
@@ -768,143 +789,6 @@ class DecodeScheduler:
         )
 
         self.out_bound_to_http_clients.send_pyobj(prefill_req)
-
-    def handle_generate_request(
-        self,
-        recv_req: TokenizedGenerateReqInput,
-    ):
-        # Create a new request
-        if (
-            recv_req.session_params is None
-            or recv_req.session_params.id is None
-            or recv_req.session_params.id not in self.sessions
-        ):
-
-            if recv_req.input_embeds is not None:
-                # Generate fake input_ids based on the length of input_embeds
-                seq_length = len(recv_req.input_embeds)
-                fake_input_ids = [1] * seq_length
-                recv_req.input_ids = fake_input_ids
-
-            # Handle custom logit processor passed to the request
-            custom_logit_processor = recv_req.custom_logit_processor
-            if (
-                not self.server_args.enable_custom_logit_processor
-                and custom_logit_processor is not None
-            ):
-                logger.warning(
-                    "The SGLang server is not configured to enable custom logit processor."
-                    "The custom logit processor passed in will be ignored."
-                    "Please set --enable-custom-logits-processor to enable this feature."
-                )
-                custom_logit_processor = None
-
-            req = Req(
-                recv_req.rid,
-                recv_req.input_text,
-                recv_req.input_ids,
-                recv_req.sampling_params,
-                return_logprob=recv_req.return_logprob,
-                top_logprobs_num=recv_req.top_logprobs_num,
-                stream=recv_req.stream,
-                lora_path=recv_req.lora_path,
-                input_embeds=recv_req.input_embeds,
-                custom_logit_processor=custom_logit_processor,
-                eos_token_ids=self.model_config.hf_eos_token_id,
-            )
-            req.tokenizer = self.tokenizer
-
-            if (
-                recv_req.session_params is not None
-                and recv_req.session_params.id is not None
-            ):
-                req.finished_reason = FINISH_ABORT(
-                    f"Invalid request: session id {recv_req.session_params.id} does not exist"
-                )
-                self.waiting_queue.append(req)
-                return
-        else:
-            # Create a new request from a previous session
-            session = self.sessions[recv_req.session_params.id]
-            req = session.create_req(recv_req, self.tokenizer)
-            if isinstance(req.finished_reason, FINISH_ABORT):
-                self.waiting_queue.append(req)
-                return
-
-        # Handle multimodal inputs
-        if recv_req.image_inputs is not None:
-            image_inputs = ImageInputs.from_dict(recv_req.image_inputs)
-            # Expand a single image token into multiple dummy tokens for receiving image embeddings
-            req.origin_input_ids = self.pad_input_ids_func(
-                req.origin_input_ids, image_inputs
-            )
-            req.extend_image_inputs(image_inputs)
-
-            if len(req.origin_input_ids) >= self.max_req_input_len:
-                error_msg = (
-                    "Multimodal prompt is too long after expanding multimodal tokens. "
-                    f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
-                )
-                logger.error(error_msg)
-                req.origin_input_ids = [0]
-                req.image_inputs = None
-                req.sampling_params.max_new_tokens = 0
-                req.finished_reason = FINISH_ABORT(
-                    error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
-                )
-                self.waiting_queue.append(req)
-                return
-
-        # Validate prompts length
-        error_msg = validate_input_length(
-            req,
-            self.max_req_input_len,
-            self.server_args.allow_auto_truncate,
-        )
-        if error_msg:
-            self.waiting_queue.append(req)
-            return
-
-        # Copy more attributes
-        if recv_req.logprob_start_len == -1:
-            # By default, only return the logprobs for output tokens
-            req.logprob_start_len = len(req.origin_input_ids) - 1
-        else:
-            req.logprob_start_len = recv_req.logprob_start_len
-
-        req.sampling_params.max_new_tokens = min(
-            (
-                req.sampling_params.max_new_tokens
-                if req.sampling_params.max_new_tokens is not None
-                else 1 << 30
-            ),
-            self.max_req_len - len(req.origin_input_ids) - 1,
-        )
-
-        # Init grammar cache for this request
-        add_to_grammar_queue = False
-        if (
-            req.sampling_params.json_schema is not None
-            or req.sampling_params.regex is not None
-            or req.sampling_params.ebnf is not None
-        ):
-            assert self.grammar_backend is not None
-            if req.sampling_params.json_schema is not None:
-                key = ("json", req.sampling_params.json_schema)
-            elif req.sampling_params.regex is not None:
-                key = ("regex", req.sampling_params.regex)
-            elif req.sampling_params.ebnf is not None:
-                key = ("ebnf", req.sampling_params.ebnf)
-
-            req.grammar = self.grammar_backend.get_cached_value(key)
-            if not req.grammar:
-                req.grammar = self.grammar_backend.get_future_value(key)
-                add_to_grammar_queue = True
-
-        if add_to_grammar_queue:
-            self.grammar_queue.append(req)
-        else:
-            self.waiting_queue.append(req)
 
     def log_decode_stats(self):
         num_used = self.max_total_num_tokens - (
@@ -989,11 +873,9 @@ class DecodeScheduler:
         if self.running_batch is None:
             self.running_batch = new_decode_batch
         else:
+            self.running_batch = self.update_running_batch(self.running_batch)
             if new_decode_batch is not None:
                 self.running_batch.merge_batch(new_decode_batch)
-
-        if self.running_batch is not None:
-            self.running_batch = self.update_running_batch(self.running_batch)
 
         ret = self.running_batch
         return ret
@@ -1041,6 +923,8 @@ class DecodeScheduler:
         #     )
 
         # Get requests from the waiting queue to a new prefill batch
+        if self.attn_tp_rank == 0:
+            print("----- get new batch -----")
         for req in self.waiting_queue:
             # if (
             #     self.lora_paths
@@ -1058,31 +942,33 @@ class DecodeScheduler:
                 self.batch_is_full = True
                 break
 
-            # if self.attn_tp_rank == 0:
-            #     print("----------------- before init next round -------------------")
-            #     print("req input size: ", len(req.origin_input_ids))
-            #     print("req output size: ", len(req.output_ids))
-            #     print("req prefix size: ", len(req.prefix_indices))
-            #     print(
-            #         f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
-            #         f"evitcable size: {self.tree_cache.evictable_size()} \n"
-            #         f"protected size: {self.tree_cache.protected_size()} \n"
-            #     )
-            #     print("----------------- before init next round -------------------")
+            if self.attn_tp_rank == 0:
+                print("----------------- before init next round -------------------")
+                print("req input size: ", len(req.origin_input_ids))
+                print("req output size: ", len(req.output_ids))
+                print("req prefix size: ", len(req.prefix_indices))
+                print(
+                    f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
+                    f"evitcable size: {self.tree_cache.evictable_size()} \n"
+                    f"protected size: {self.tree_cache.protected_size()} \n"
+                )
+                print("----------------- before init next round -------------------")
 
-            req.init_next_round_input(None if prefix_computed else self.tree_cache)
+            ## TODO: here has to initilaize req.last_node
+            req.init_next_round_input(self.tree_cache)
+            assert req.last_node is not None
 
-            # if self.attn_tp_rank == 0:
-            #     print("----------------- after init next round -------------------")
-            #     print("req input size: ", len(req.origin_input_ids))
-            #     print("req output size: ", len(req.output_ids))
-            #     print("req prefix size: ", len(req.prefix_indices))
-            #     print(
-            #         f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
-            #         f"evitcable size: {self.tree_cache.evictable_size()} \n"
-            #         f"protected size: {self.tree_cache.protected_size()} \n"
-            #     )
-            #     print("----------------- after init next round -------------------")
+            if self.attn_tp_rank == 0:
+                print("----------------- after init next round -------------------")
+                print("req input size: ", len(req.origin_input_ids))
+                print("req output size: ", len(req.output_ids))
+                print("req prefix size: ", len(req.prefix_indices))
+                print(
+                    f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
+                    f"evitcable size: {self.tree_cache.evictable_size()} \n"
+                    f"protected size: {self.tree_cache.protected_size()} \n"
+                )
+                print("----------------- after init next round -------------------")
 
             if self.enable_hierarchical_cache and req.last_node is not None:
                 if req.last_node.evicted:
@@ -1150,33 +1036,33 @@ class DecodeScheduler:
             self.server_args.return_hidden_states,
         )
 
-        # if self.attn_tp_rank == 0:
-        #     print("----------------- before prepare for extend -------------------")
-        #     print("req input size: ", len(req.origin_input_ids))
-        #     print("req output size: ", len(req.output_ids))
-        #     print("req prefix size: ", len(req.prefix_indices))
-        #     print(
-        #         f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
-        #         f"evitcable size: {self.tree_cache.evictable_size()} \n"
-        #         f"protected size: {self.tree_cache.protected_size()} \n"
-        #     )
-        #     print("----------------- before prepare for extend -------------------")
+        if self.attn_tp_rank == 0:
+            print("----------------- before prepare for extend -------------------")
+            print("req input size: ", len(req.origin_input_ids))
+            print("req output size: ", len(req.output_ids))
+            print("req prefix size: ", len(req.prefix_indices))
+            print(
+                f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
+                f"evitcable size: {self.tree_cache.evictable_size()} \n"
+                f"protected size: {self.tree_cache.protected_size()} \n"
+            )
+            print("----------------- before prepare for extend -------------------")
         new_batch.prepare_for_extend()
 
         # convert list[int] to tensor, also assume output_id for each req is length = 1
         new_batch.output_ids = torch.tensor([req.output_ids[0] for req in can_run_list]).to(f'cuda:{self.attn_tp_rank}')
 
-        # if self.attn_tp_rank == 0:
-        #     print("----------------- after prepare for extend -------------------")
-        #     print("req input size: ", len(req.origin_input_ids))
-        #     print("req output size: ", len(req.output_ids))
-        #     print("req prefix size: ", len(req.prefix_indices))
-        #     print(
-        #         f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
-        #         f"evitcable size: {self.tree_cache.evictable_size()} \n"
-        #         f"protected size: {self.tree_cache.protected_size()} \n"
-        #     )
-        #     print("----------------- after prepare for extend -------------------")
+        if self.attn_tp_rank == 0:
+            print("----------------- after prepare for extend -------------------")
+            print("req input size: ", len(req.origin_input_ids))
+            print("req output size: ", len(req.output_ids))
+            print("req prefix size: ", len(req.prefix_indices))
+            print(
+                f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
+                f"evitcable size: {self.tree_cache.evictable_size()} \n"
+                f"protected size: {self.tree_cache.protected_size()} \n"
+            )
+            print("----------------- after prepare for extend -------------------")
 
 
         # Mixed-style chunked prefill
@@ -1194,7 +1080,7 @@ class DecodeScheduler:
         #     self.running_batch = None
         # else:
         #     new_batch.decoding_reqs = None
-
+        new_batch.forward_mode = ForwardMode.DECODE
         return new_batch
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
@@ -1243,26 +1129,32 @@ class DecodeScheduler:
             self.batch_is_full = False
 
         
-        # if self.attn_tp_rank == 0:
-        #     print("----------------- before prepare for decode -------------------")
-        #     print(
-        #         f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
-        #         f"evitcable size: {self.tree_cache.evictable_size()} \n"
-        #         f"protected size: {self.tree_cache.protected_size()} \n"
-        #     )
-        #     print("----------------- before prepare for decode -------------------")
+        if self.attn_tp_rank == 0:
+            print("----------------- before prepare for decode -------------------")
+            print("req input size: ", len(batch.reqs[0].origin_input_ids))
+            print("req output size: ", len(batch.reqs[0].output_ids))
+            print("req prefix size: ", len(batch.reqs[0].prefix_indices))
+            print(
+                f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
+                f"evitcable size: {self.tree_cache.evictable_size()} \n"
+                f"protected size: {self.tree_cache.protected_size()} \n"
+            )
+            print("----------------- before prepare for decode -------------------")
 
         # Update batch tensors
         batch.prepare_for_decode()
 
-        # if self.attn_tp_rank == 0:
-        #     print("----------------- after prepare for decode -------------------")
-        #     print(
-        #         f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
-        #         f"evitcable size: {self.tree_cache.evictable_size()} \n"
-        #         f"protected size: {self.tree_cache.protected_size()} \n"
-        #     )
-        #     print("----------------- after prepare for decode -------------------")
+        if self.attn_tp_rank == 0:
+            print("----------------- after prepare for decode -------------------")
+            print("req input size: ", len(batch.reqs[0].origin_input_ids))
+            print("req output size: ", len(batch.reqs[0].output_ids))
+            print("req prefix size: ", len(batch.reqs[0].prefix_indices))
+            print(
+                f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
+                f"evitcable size: {self.tree_cache.evictable_size()} \n"
+                f"protected size: {self.tree_cache.protected_size()} \n"
+            )
+            print("----------------- after prepare for decode -------------------")
         return batch
 
     def run_batch(
@@ -1483,25 +1375,25 @@ class DecodeScheduler:
             req.check_finished()
 
             if req.finished():
-                # if self.attn_tp_rank == 0:
-                #     print("req input size: ", len(req.origin_input_ids))
-                #     print("req output size: ", len(req.output_ids))
-                #     print("req prefix size: ", len(req.prefix_indices))
-                #     print(
-                #         f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
-                #         f"evitcable size: {self.tree_cache.evictable_size()} \n"
-                #         f"protected size: {self.tree_cache.protected_size()} \n"
-                #     )
+                if self.attn_tp_rank == 0:
+                    print("req input size: ", len(req.origin_input_ids))
+                    print("req output size: ", len(req.output_ids))
+                    print("req prefix size: ", len(req.prefix_indices))
+                    print(
+                        f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
+                        f"evitcable size: {self.tree_cache.evictable_size()} \n"
+                        f"protected size: {self.tree_cache.protected_size()} \n"
+                    )
                 self.tree_cache.cache_finished_req(req)
-                # if self.attn_tp_rank == 0:
-                #     print("!!!req input size: ", len(req.origin_input_ids))
-                #     print("!!!req output size: ", len(req.output_ids))
-                #     print("!!!req prefix size: ", len(req.prefix_indices))
-                #     print(
-                #         f"!!!avaiable size: {self.token_to_kv_pool.available_size()} \n"
-                #         f"!!!evitcable size: {self.tree_cache.evictable_size()} \n"
-                #         f"!!!protected size: {self.tree_cache.protected_size()} \n"
-                #     )
+                if self.attn_tp_rank == 0:
+                    print("!!!req input size: ", len(req.origin_input_ids))
+                    print("!!!req output size: ", len(req.output_ids))
+                    print("!!!req prefix size: ", len(req.prefix_indices))
+                    print(
+                        f"!!!avaiable size: {self.token_to_kv_pool.available_size()} \n"
+                        f"!!!evitcable size: {self.tree_cache.evictable_size()} \n"
+                        f"!!!protected size: {self.tree_cache.protected_size()} \n"
+                    )
 
             if req.return_logprob:
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
